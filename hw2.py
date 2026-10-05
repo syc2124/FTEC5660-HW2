@@ -144,6 +144,17 @@ def trace_agent(result: dict) -> None:
             if text:
                 print(f"    [ai] {text[:150]}")
 
+def lenient_score(text: str) -> float | None:
+    """parse_score 失败时的兜底：取文本里最后一个落在 [0,1] 的数字。"""
+    for token in reversed(re.findall(r"\d+(?:\.\d+)?", text)):
+        try:
+            value = float(token)
+        except ValueError:
+            continue
+        if 0.0 <= value <= 1.0:
+            return value
+    return None
+
 def build_agent(tools: list[Any]) -> Any:
     """Create and return your agent once.
 
@@ -190,24 +201,41 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
     ### YOUR CODE HERE
     import time
 
-    semaphore = asyncio.Semaphore(3)  # 服务器全班共用，最多 3 份同时跑
+    semaphore = asyncio.Semaphore(3)   # 服务器全班共用，最多 3 份同时跑
+    ATTEMPTS = 3                       # 网络瞬断时重试
 
     async def one(name: str, text: str) -> tuple[str, float | None]:
         async with semaphore:
             print(f"[cv] {name}")
             t0 = time.time()
             try:
-                result = await agent.ainvoke(
-                    {"messages": [{"role": "user", "content": text}]},
-                    config={"recursion_limit": 150},  # 兜底：防某一份陷入死循环
-                )
-                trace_agent(result)
-                answer = result["messages"][-1]
-                print(f"    [score] {str(getattr(answer, 'content', answer))[:80]!r}")
-                return name, parse_score(answer)
-            except Exception as exc:
-                for sub in flatten_exception(exc):
-                    print(f"    [error] {name} {type(sub).__name__}: {sub}")
+                for attempt in range(1, ATTEMPTS + 1):
+                    try:
+                        result = await agent.ainvoke(
+                            {"messages": [{"role": "user", "content": text}]},
+                            config={"recursion_limit": 150},
+                        )
+                        trace_agent(result)
+                        answer = result["messages"][-1]
+                        content = str(getattr(answer, "content", answer))
+
+                        score = parse_score(answer)
+                        if score is None:
+                            score = lenient_score(content)
+                            print(f"    [fallback] {name} -> {score} from {content[:70]!r}")
+
+                        print(f"    [score] {name} {score}")
+                        return name, score
+
+                    except Exception as exc:
+                        causes = list(flatten_exception(exc))
+                        kinds = ", ".join(type(c).__name__ for c in causes)
+                        print(f"    [warn] {name} attempt {attempt}/{ATTEMPTS}: {kinds}")
+                        if attempt == ATTEMPTS:
+                            for c in causes:
+                                print(f"    [error] {name} {type(c).__name__}: {c}")
+                            return name, None
+                        await asyncio.sleep(2.0 * attempt)   # 退避后重试
                 return name, None
             finally:
                 print(f"    [time] {name} {time.time() - t0:.1f}s")
@@ -215,7 +243,6 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
     started = time.time()
     pairs = await asyncio.gather(*(one(n, t) for n, t in cvs.items()))
     print(f"\n[total] {time.time() - started:.1f}s for {len(cvs)} CV(s)")
-
     return dict(pairs)
 
 
