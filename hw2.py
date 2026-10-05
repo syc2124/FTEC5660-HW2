@@ -67,6 +67,82 @@ async def load_mcp_tools() -> list[Any]:
     )
     return await client.get_tools()
 
+SYSTEM_PROMPT = """You are a CV verification agent performing a KYC-style background check.
+
+You will be given the full text of ONE candidate's CV. Decide whether every
+verifiable claim in it agrees with that candidate's LinkedIn profile, and
+report a reliability score.
+
+You may ONLY use the SocialGraph tools you have been given. Never use outside
+knowledge, never guess, and never invent a profile.
+
+--- STEP 1: find the right person ---
+Many people share the same name. Search by the name on the CV first, then narrow
+the search with the city and the industry taken from the CV. Then fetch the full
+LinkedIn profile of each plausible candidate, and keep the one whose employers
+and schools actually line up with the CV.
+A candidate whose employers and schools are unrelated to the CV is a different
+person with the same name - discard it and try another one.
+Never settle for the first search hit.
+
+--- STEP 2: compare only these fields ---
+- name
+- city
+- jobs: company, title, seniority, start year, end year
+- education: school, degree, field, graduation year
+- skills
+Ignore everything else. Job-description bullets, the headline and the hometown
+are NEVER the source of a discrepancy.
+
+--- STEP 3: what counts ---
+NOT a discrepancy (wording only):
+- "Bachelor of Science" vs "BSc", "UI/UX Design" vs "UI/UX"
+- "Senior Engineer" when the profile says Engineer with seniority senior
+- the CV lists FEWER skills than the profile
+
+A discrepancy (one is enough):
+- an inflated job title, or a seniority that does not match
+- a shifted employment or graduation year
+- an upgraded degree, or a school/employer absent from the profile
+- a city that does not match
+- a skill the profile does not have
+
+--- STEP 4: score ---
+Any discrepancy  -> a low score, at or below 0.5 (for example 0.1).
+Everything agrees -> a high score, above 0.5 (for example 0.9).
+
+Work efficiently: a handful of tool calls per CV is enough.
+
+--- OUTPUT ---
+Reply with a single number between 0 and 1 and nothing else. No explanation,
+no other numbers.
+"""
+
+def flatten_exception(exc):
+    """把 ExceptionGroup 里的真实错误一层层摊开。"""
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            yield from flatten_exception(sub)
+    else:
+        yield exc
+
+
+def trace_agent(result: dict) -> None:
+    """打印 agent 的完整思考轨迹：调了哪些工具、返回了什么。"""
+    for message in result.get("messages", []):
+        kind = type(message).__name__
+        if kind == "HumanMessage":
+            continue
+        for call in getattr(message, "tool_calls", None) or []:
+            args = str(call.get("args"))[:120]
+            print(f"    [tool] {call.get('name')}({args})")
+        if kind == "ToolMessage":
+            text = " ".join(str(message.content).split())[:150]
+            print(f"    [result] {text}")
+        else:
+            text = " ".join(str(getattr(message, "content", "")).split())
+            if text:
+                print(f"    [ai] {text[:150]}")
 
 def build_agent(tools: list[Any]) -> Any:
     """Create and return your agent once.
@@ -83,8 +159,14 @@ def build_agent(tools: list[Any]) -> Any:
     from .env.
     """
     ### YOUR CODE HERE
-    _ = tools
-    return None
+    from langchain.agents import create_agent
+    from langchain_deepseek import ChatDeepSeek
+
+    model = ChatDeepSeek(
+        model=MODEL_NAME,  # = "deepseek-v4-flash"
+        temperature=0,
+    )
+    return create_agent(model, tools, system_prompt=SYSTEM_PROMPT)
 
 
 async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
@@ -106,8 +188,35 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
     shared by the whole class.
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: None for name in cvs}
+    import time
+
+    semaphore = asyncio.Semaphore(3)  # 服务器全班共用，最多 3 份同时跑
+
+    async def one(name: str, text: str) -> tuple[str, float | None]:
+        async with semaphore:
+            print(f"[cv] {name}")
+            t0 = time.time()
+            try:
+                result = await agent.ainvoke(
+                    {"messages": [{"role": "user", "content": text}]},
+                    config={"recursion_limit": 150},  # 兜底：防某一份陷入死循环
+                )
+                trace_agent(result)
+                answer = result["messages"][-1]
+                print(f"    [score] {str(getattr(answer, 'content', answer))[:80]!r}")
+                return name, parse_score(answer)
+            except Exception as exc:
+                for sub in flatten_exception(exc):
+                    print(f"    [error] {name} {type(sub).__name__}: {sub}")
+                return name, None
+            finally:
+                print(f"    [time] {name} {time.time() - t0:.1f}s")
+
+    started = time.time()
+    pairs = await asyncio.gather(*(one(n, t) for n, t in cvs.items()))
+    print(f"\n[total] {time.time() - started:.1f}s for {len(cvs)} CV(s)")
+
+    return dict(pairs)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
