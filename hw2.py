@@ -201,8 +201,9 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
     ### YOUR CODE HERE
     import time
 
-    semaphore = asyncio.Semaphore(3)   # 服务器全班共用，最多 3 份同时跑
-    ATTEMPTS = 3                       # 网络瞬断时重试
+    semaphore = asyncio.Semaphore(3)
+    ATTEMPTS = 3
+    PER_CV_BUDGET = 180.0  # 单份简历的总时间预算（含重试），单位秒
 
     async def one(name: str, text: str) -> tuple[str, float | None]:
         async with semaphore:
@@ -210,23 +211,21 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
             t0 = time.time()
             try:
                 for attempt in range(1, ATTEMPTS + 1):
+                    left = PER_CV_BUDGET - (time.time() - t0)
+                    if left <= 5:
+                        print(f"    [error] {name} out of budget after {time.time() - t0:.0f}s")
+                        return name, None
                     try:
-                        result = await agent.ainvoke(
-                            {"messages": [{"role": "user", "content": text}]},
-                            config={"recursion_limit": 150},
+                        result = await asyncio.wait_for(
+                            agent.ainvoke(
+                                {"messages": [{"role": "user", "content": text}]},
+                                config={"recursion_limit": 150},
+                            ),
+                            timeout=left,  # 每次尝试最多用掉"剩余预算"
                         )
-                        trace_agent(result)
-                        answer = result["messages"][-1]
-                        content = str(getattr(answer, "content", answer))
-
-                        score = parse_score(answer)
-                        if score is None:
-                            score = lenient_score(content)
-                            print(f"    [fallback] {name} -> {score} from {content[:70]!r}")
-
-                        print(f"    [score] {name} {score}")
-                        return name, score
-
+                    except TimeoutError:
+                        print(f"    [error] {name} exceeded {PER_CV_BUDGET:.0f}s budget")
+                        return name, None
                     except Exception as exc:
                         causes = list(flatten_exception(exc))
                         kinds = ", ".join(type(c).__name__ for c in causes)
@@ -235,7 +234,18 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
                             for c in causes:
                                 print(f"    [error] {name} {type(c).__name__}: {c}")
                             return name, None
-                        await asyncio.sleep(2.0 * attempt)   # 退避后重试
+                        await asyncio.sleep(2.0 * attempt)
+                        continue
+
+                    trace_agent(result)
+                    answer = result["messages"][-1]
+                    content = str(getattr(answer, "content", answer))
+                    score = parse_score(answer)
+                    if score is None:
+                        score = lenient_score(content)
+                        print(f"    [fallback] {name} -> {score} from {content[:70]!r}")
+                    print(f"    [score] {name} {score}")
+                    return name, score
                 return name, None
             finally:
                 print(f"    [time] {name} {time.time() - t0:.1f}s")
