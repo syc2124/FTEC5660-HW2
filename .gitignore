@@ -2,3 +2,14 @@
 .venv/
 __pycache__/
 results.csv
+
+# --- local dev / experiment files (not part of the submission) ---
+.idea/
+make_*.py
+probe_*
+run_*.txt
+run5.ps1
+tmp_*
+verify_*.txt
+task2/_baseline_cv.pdf
+task2_tmp_baseline.pdf
